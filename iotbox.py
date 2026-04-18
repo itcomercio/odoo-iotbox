@@ -1,11 +1,17 @@
 from flask import Flask, request, jsonify, make_response
 import serial
 import os
+import time
 
 app = Flask(__name__)
 
 BAUD_RATE = 9600
 CANDIDATE_PORTS = ['/dev/usb/lp0', '/dev/ttyUSB0']
+CASHBOX_PULSE = b'\x1bp\x00\x19\xfa'
+TEST_MODE = os.getenv('IOTBOX_TEST_MODE', '0').lower() in ('1', 'true', 'yes', 'on')
+TEST_TEXT = os.getenv('IOTBOX_TEST_TEXT', 'Hello')
+TEST_COOLDOWN_SECONDS = float(os.getenv('IOTBOX_TEST_COOLDOWN_SECONDS', '10'))
+LAST_TEST_PRINT_TS = 0.0
 
 
 def _cors_response(response):
@@ -83,6 +89,27 @@ def _write_to_serial(data):
         return False, str(err)
 
 
+def _send_short_test_ticket_and_open_cashbox():
+    global LAST_TEST_PRINT_TS
+
+    now = time.monotonic()
+    if now - LAST_TEST_PRINT_TS < TEST_COOLDOWN_SECONDS:
+        print('Modo test activo: se ignora impresion repetida por cooldown')
+        return True, None
+
+    # Simple ESC/POS payload for a short test line.
+    short_ticket = b'\x1b@' + TEST_TEXT.encode('utf-8', errors='replace') + b'\n\n'
+
+    ok, err = _write_to_serial(short_ticket)
+    if not ok:
+        return False, err
+
+    ok, err = _write_to_serial(CASHBOX_PULSE)
+    if ok:
+        LAST_TEST_PRINT_TS = now
+    return ok, err
+
+
 def _jsonrpc_ok(result=True):
     return jsonify({'jsonrpc': '2.0', 'result': result})
 
@@ -98,7 +125,13 @@ def print_receipt():
     data = request.data
 
     print(f'Recibido ticket ({len(data)} bytes) desde {request.remote_addr}')
-    ok, err = _write_to_serial(data)
+
+    if TEST_MODE:
+        print('Modo test activo: se imprime ticket corto y se abre cajon')
+        ok, err = _send_short_test_ticket_and_open_cashbox()
+    else:
+        ok, err = _write_to_serial(data)
+
     if ok:
         return _jsonrpc_ok(True)
 
@@ -123,9 +156,11 @@ def default_printer_action():
 
     print(f"default_printer_action action='{action}' bytes={len(data)}")
 
-    if action in ('cashbox', 'open_cashbox'):
-        pulse = b'\x1bp\x00\x19\xfa'
-        ok, err = _write_to_serial(pulse)
+    if TEST_MODE and action in ('', 'print_receipt', 'print_xml_receipt', 'print'):
+        print('Modo test activo desde default_printer_action')
+        ok, err = _send_short_test_ticket_and_open_cashbox()
+    elif action in ('cashbox', 'open_cashbox'):
+        ok, err = _write_to_serial(CASHBOX_PULSE)
     else:
         ok, err = _write_to_serial(data)
 
@@ -139,8 +174,7 @@ def default_printer_action():
 @app.route('/hw_proxy/open_cashbox', methods=['POST'])
 def open_cashbox():
     # ESC/POS pulse command; may be ignored by printers without drawer port.
-    pulse = b'\x1bp\x00\x19\xfa'
-    ok, err = _write_to_serial(pulse)
+    ok, err = _write_to_serial(CASHBOX_PULSE)
     if ok:
         return _jsonrpc_ok(True)
     return _jsonrpc_error(err, 500)
